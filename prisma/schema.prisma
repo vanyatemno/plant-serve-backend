@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  refreshTokens  RefreshToken[]
+  plantAnalyses  PlantAnalysis[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  tokenHash String   @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model PlantAnalysis {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  s3Key      String   @map("s3_key")
+  prediction String
+  confidence Float
+  isHealthy  Boolean  @map("is_healthy")
+  plantType  String   @map("plant_type")
+  mlResponse Json     @map("ml_response")
+  aiAdvice   String   @map("ai_advice") @db.Text
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("plant_analyses")
+}
