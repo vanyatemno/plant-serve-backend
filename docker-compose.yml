@@ -13,6 +13,17 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  s3mock:
+    image: adobe/s3mock:latest
+    restart: unless-stopped
+    ports:
+      - '9090:9090'
+    environment:
+      - initialBuckets=${AWS_S3_BUCKET}
+      - debug=true
+    volumes:
+      - s3mock_data:/s3mockroot
+
   app:
     build:
       context: .
@@ -22,6 +33,7 @@ services:
       - '3000:3000'
     depends_on:
       - postgres
+      - s3mock
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/plant_serve?schema=public
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
@@ -30,8 +42,11 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      AWS_S3_ENDPOINT: http://s3mock:9090
+      AWS_S3_FORCE_PATH_STYLE: 'true'
       ML_SERVICE_URL: ${ML_SERVICE_URL}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
 
 volumes:
   postgres_data:
+  s3mock_data:

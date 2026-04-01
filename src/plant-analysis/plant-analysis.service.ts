@@ -1,5 +1,6 @@
 import {
   ForbiddenException,
+  Inject,
   Injectable,
   InternalServerErrorException,
   Logger,
@@ -7,7 +8,6 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import Anthropic from '@anthropic-ai/sdk';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -15,33 +15,24 @@ import {
   PaginationQueryDto,
   PlantAnalysisResponseDto,
 } from './dto';
-
-interface MlTopPrediction {
-  label: string;
-  confidence: number;
-  class_id: number;
-}
-
-interface MlServiceResponse {
-  prediction: string;
-  confidence: number;
-  class_id: number;
-  is_healthy: boolean;
-  plant_type: string;
-  top_predictions: MlTopPrediction[];
-}
+import {
+  AI_ENRICHMENT_SERVICE,
+  type IAiEnrichmentService,
+} from './interfaces';
+import type { MlServiceResponse } from './interfaces';
 
 @Injectable()
 export class PlantAnalysisService {
   private readonly logger = new Logger(PlantAnalysisService.name);
   private readonly s3Client: S3Client;
-  private readonly anthropic: Anthropic;
   private readonly s3Bucket: string;
   private readonly mlServiceUrl: string;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    @Inject(AI_ENRICHMENT_SERVICE)
+    private readonly aiEnrichmentService: IAiEnrichmentService,
   ) {
     this.s3Client = new S3Client({
       region: this.configService.getOrThrow<string>('AWS_REGION'),
@@ -51,10 +42,10 @@ export class PlantAnalysisService {
           'AWS_SECRET_ACCESS_KEY',
         ),
       },
-    });
-
-    this.anthropic = new Anthropic({
-      apiKey: this.configService.getOrThrow<string>('ANTHROPIC_API_KEY'),
+      ...(this.configService.get<string>('AWS_S3_ENDPOINT') && {
+        endpoint: this.configService.get<string>('AWS_S3_ENDPOINT'),
+        forcePathStyle: true,
+      }),
     });
 
     this.s3Bucket = this.configService.getOrThrow<string>('AWS_S3_BUCKET');
@@ -70,10 +61,11 @@ export class PlantAnalysisService {
     const s3Key = await this.uploadToS3(file);
 
     // 2. Call ML microservice
-    const mlResponse = await this.callMlService(s3Key);
+    const mlResponse = await this.callMlService(file);
+    this.logger.log(mlResponse);
 
-    // 3. AI enrichment via Anthropic Claude
-    const aiAdvice = await this.getAiAdvice(mlResponse);
+    // 3. AI enrichment via injected service
+    const aiAdvice = await this.aiEnrichmentService.getAdvice(mlResponse);
 
     // 4. Persist to DB
     const analysis = await this.prisma.plantAnalysis.create({
@@ -158,12 +150,19 @@ export class PlantAnalysisService {
   }
 
   // ─── Private: ML Service Call ──────────────────────────────────────
-  private async callMlService(s3Key: string): Promise<MlServiceResponse> {
+  private async callMlService(
+    // s3Key: string,
+    image: Express.Multer.File,
+    ): Promise<MlServiceResponse> {
     try {
-      const response = await fetch(this.mlServiceUrl, {
+      const response = await fetch(`${this.mlServiceUrl}/predict/base64`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ s3_key: s3Key }),
+        // body: JSON.stringify({ s3_key: s3Key }), // todo: change to s3 key
+        body: JSON.stringify({
+          image: `data:image/jpeg;base64,${image.buffer.toString('base64')}`,
+          top_k: 1,
+        }),
       });
 
       if (!response.ok) {
@@ -176,71 +175,6 @@ export class PlantAnalysisService {
       throw new InternalServerErrorException(
         'Failed to get prediction from ML service',
       );
-    }
-  }
-
-  // ─── Private: Anthropic AI Enrichment ──────────────────────────────
-  private async getAiAdvice(mlResponse: MlServiceResponse): Promise<string> {
-    const { confidence, prediction, plant_type, top_predictions, is_healthy } =
-      mlResponse;
-
-    let prompt: string;
-
-    if (confidence < 0.75) {
-      // Low confidence — ask Claude to independently estimate
-      prompt = `You are an expert plant pathologist. An ML model analyzed a plant image but returned a low-confidence result.
-
-Plant type detected: ${plant_type}
-ML prediction: ${prediction} (confidence: ${(confidence * 100).toFixed(2)}%)
-Is healthy: ${is_healthy}
-
-Top predictions from the model:
-${top_predictions.map((p) => `- ${p.label}: ${(p.confidence * 100).toFixed(4)}%`).join('\n')}
-
-Full ML response: ${JSON.stringify(mlResponse)}
-
-Because the confidence is low, please:
-1. Independently estimate the most likely plant disease based on the plant type and the top predictions provided
-2. Provide your own diagnosis with reasoning
-3. Give practical care and treatment advice for the most likely condition
-4. Mention any additional symptoms the user should look for to confirm the diagnosis
-
-Please be thorough but practical in your response.`;
-    } else {
-      // High confidence — generate treatment guide
-      prompt = `You are an expert plant pathologist. An ML model has identified a plant condition with high confidence.
-
-Plant type: ${plant_type}
-Diagnosis: ${prediction} (confidence: ${(confidence * 100).toFixed(2)}%)
-Is healthy: ${is_healthy}
-
-Full ML response: ${JSON.stringify(mlResponse)}
-
-Please provide a comprehensive, practical care and treatment guide for this condition:
-1. Brief explanation of what ${prediction} is and how it affects ${plant_type}
-2. Immediate steps the user should take
-3. Treatment options (organic and chemical if applicable)
-4. Prevention strategies for the future
-5. Expected recovery timeline if treatment is followed
-
-${is_healthy ? 'Since the plant appears healthy, focus on maintenance tips and preventive care.' : 'Focus on treatment and recovery steps.'}
-
-Please be thorough but practical in your response.`;
-    }
-
-    try {
-      const message = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        messages: [{ role: 'user', content: prompt }],
-      });
-
-      // Extract text from the response
-      const textBlock = message.content.find((block) => block.type === 'text');
-      return textBlock?.text || 'No advice could be generated.';
-    } catch (error) {
-      this.logger.error('Anthropic API call failed', error);
-      return 'AI advice is temporarily unavailable. Please consult a local plant specialist.';
     }
   }
 }
